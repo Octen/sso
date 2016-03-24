@@ -18,7 +18,7 @@ abstract class Server
      * @var array
      */
     protected $options;
-    
+
     /**
      * Cache that stores the special session data for the brokers.
      *
@@ -36,6 +36,12 @@ abstract class Server
      */
     protected $brokerId;
 
+    /**
+     * Constants for Options
+     */
+    const OPTION_FAIL_EXCEPTION = 'fail_exception';
+    const OPTION_CACHE_DIRECTORY = 'FilesCacheDirectory';
+    const OPTION_CACHE_TTL = 'FilesCacheTtl';
 
     /**
      * Class constructor
@@ -44,8 +50,33 @@ abstract class Server
      */
     public function __construct(array $options = [])
     {
-        $this->options = $options;
+        $this->options = $this->loadOptions($options);
         $this->cache = $this->createCacheAdapter();
+    }
+
+    /**
+     * Initialize options
+     *
+     * @param array $options
+     * @return array
+     */
+    protected function loadOptions(array $options = [])
+    {
+        $defaultOptions = [
+            self::OPTION_CACHE_DIRECTORY => '/tmp',
+            self::OPTION_CACHE_TTL       => 10 * 3600,
+        ];
+
+        return array_merge($defaultOptions, $options);
+    }
+
+    /**
+     * @param $key
+     * @return string|null
+     */
+    protected function getOption($key)
+    {
+        return isset($this->options[$key]) ? $this->options[$key] : null;
     }
 
     /**
@@ -55,60 +86,61 @@ abstract class Server
      */
     protected function createCacheAdapter()
     {
-        $adapter = new Adapter\File('/tmp');
-        $adapter->setOption('ttl', 10 * 3600);
-        
+        $adapter = new Adapter\File($this->getOption(self::OPTION_CACHE_DIRECTORY));
+        $adapter->setOption('ttl', $this->getOption(self::OPTION_CACHE_TTL));
+
         return new Cache($adapter);
     }
-    
+
     /**
      * Start the session for broker requests to the SSO server
      */
     public function startBrokerSession()
     {
         if (isset($this->brokerId)) return;
-    
+
         if (!isset($_GET['sso_session'])) {
             return $this->fail("No session", 400);
         }
-        
+
         $sid = $_GET['sso_session'];
-        
+
         $linkedId = $this->cache->get($sid);
-    
+
         if (!$linkedId) {
             return $this->fail("The broker session id isn't attached to a user session", 403);
         }
 
         if (session_status() === PHP_SESSION_ACTIVE) {
             if ($linkedId !== session_id()) throw new \Exception("Session has already started", 400);
+
             return;
         }
-        
+
         session_id($linkedId);
         session_start();
 
         $this->brokerId = $this->validateBrokerSessionId($sid);
     }
-    
+
     /**
      * Validate the broker session id
-     * 
+     *
      * @return string  the broker id
      */
     protected function validateBrokerSessionId($sid)
     {
         $matches = null;
-        
+
         if (!preg_match('/^SSO-(\w*+)-(\w*+)-([a-z0-9]*+)$/', $_GET['sso_session'], $matches)) {
             return $this->fail("Invalid session id");
         }
-        
+
         $brokerId = $matches[1];
         $token = $matches[2];
-        
+
         $clientAddr = $this->getSessionData('client_addr');
-        
+
         if (!$clientAddr) {
             return $this->fail("Unknown client IP address for the attached session", 500);
         }
@@ -116,7 +148,7 @@ abstract class Server
         if ($this->generateSessionId($brokerId, $token, $clientAddr) != $sid) {
             return $this->fail("Checksum failed: Client IP address may have changed", 403);
         }
-        
+
         return $brokerId;
     }
 
@@ -128,16 +160,16 @@ abstract class Server
         if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 
         $clientAddr = $this->getSessionData('client_addr');
-        
+
         if ($clientAddr && $clientAddr !== $_SERVER['REMOTE_ADDR']) {
             session_regenerate_id(true);
         }
-        
+
         if (!$clientAddr) {
             $this->setSessionData('client_addr', static::getRemoteAddr());
         }
-    }    
-    
+    }
+
     /**
      * Generate session id from session token
      *
@@ -161,12 +193,12 @@ abstract class Server
     protected function generateAttachChecksum($brokerId, $token)
     {
         $broker = $this->getBrokerInfo($brokerId);
-        
+
         if (!isset($broker)) return null;
 
         return hash('sha256', 'attach' . $token . static::getRemoteAddr() . $broker['secret']);
     }
-    
+
 
     /**
      * Detect the type for the HTTP response.
@@ -191,21 +223,21 @@ abstract class Server
     public function attach()
     {
         $this->detectReturnType();
-        
+
         if (empty($_REQUEST['broker'])) return $this->fail("No broker specified", 400);
         if (empty($_REQUEST['token'])) return $this->fail("No token specified", 400);
 
         if (!$this->returnType) return $this->fail("No return url specified", 400);
 
         $checksum = $this->generateAttachChecksum($_REQUEST['broker'], $_REQUEST['token']);
-        
+
         if (empty($_REQUEST['checksum']) || $checksum != $_REQUEST['checksum']) {
             return $this->fail("Invalid checksum", 400);
         }
 
         $this->startUserSession();
         $sid = $this->generateSessionId($_REQUEST['broker'], $_REQUEST['token']);
-        
+
         $this->cache->set($sid, $this->getSessionData('id'));
         $this->outputAttachSuccess();
     }
@@ -218,17 +250,17 @@ abstract class Server
         if ($this->returnType === 'image') {
             $this->outputImage();
         }
-        
+
         if ($this->returnType === 'json') {
-            header('Content-type: application/json; charset=UTF-8');        
+            header('Content-type: application/json; charset=UTF-8');
             echo json_encode(['success' => 'attached']);
         }
-        
+
         if ($this->returnType === 'jsonp') {
             $data = json_encode(['success' => 'attached']);
             echo $_REQUEST['callback'] . "($data, 200);";
         }
-        
+
         if ($this->returnType === 'redirect') {
             $url = $_REQUEST['return_url'];
             header("Location: $url", true, 307);
@@ -287,9 +319,9 @@ abstract class Server
     {
         $this->startBrokerSession();
         $user = null;
-        
+
         $username = $this->getSessionData('sso_user');
-        
+
         if ($username) {
             $user = $this->getUserInfo($username);
             if (!$user) return $this->fail("User not found", 500); // Shouldn't happen
@@ -299,10 +331,10 @@ abstract class Server
         echo json_encode($user);
     }
 
-    
+
     /**
      * Set session data
-     * 
+     *
      * @param string $key
      * @param string $value
      */
@@ -310,39 +342,40 @@ abstract class Server
     {
         if (!isset($value)) {
             unset($_SESSION[$key]);
+
             return;
         }
-        
+
         $_SESSION[$key] = $value;
     }
-    
+
     /**
      * Get session data
-     * 
+     *
      * @param type $key
      */
     protected function getSessionData($key)
     {
         if ($key === 'id') return session_id();
-        
+
         return isset($_SESSION[$key]) ? $_SESSION[$key] : null;
     }
-    
+
 
     /**
      * An error occured.
      *
      * @param string $message
-     * @param int    $http_status
+     * @param int $http_status
      */
     protected function fail($message, $http_status = 500)
     {
-        if (!empty($this->options['fail_exception'])) {
+        if (!empty($this->getOption(self::OPTION_FAIL_EXCEPTION))) {
             throw new Exception($message, $http_status);
         }
-    
+
         if ($http_status === 500) trigger_error($message, E_USER_WARNING);
-        
+
         if ($this->returnType === 'jsonp') {
             echo $_REQUEST['callback'] . "(" . json_encode(['error' => $message]) . ", $http_status);";
             exit();
@@ -354,7 +387,7 @@ abstract class Server
             echo "You're being redirected to <a href='{$url}'>$url</a>";
             exit();
         }
-        
+
         http_response_code($http_status);
         header('Content-type: application/json; charset=UTF-8');
 
@@ -362,7 +395,7 @@ abstract class Server
         exit();
     }
 
-    
+
     /**
      * Authenticate using user credentials
      *
@@ -371,7 +404,7 @@ abstract class Server
      * @return \Jasny\ValidationResult
      */
     abstract protected function authenticate($username, $password);
-    
+
     /**
      * Get the secret key and other info of a broker
      *
@@ -379,7 +412,7 @@ abstract class Server
      * @return array
      */
     abstract protected function getBrokerInfo($brokerId);
-    
+
     /**
      * Get the information about a user
      *
@@ -387,8 +420,8 @@ abstract class Server
      * @return array|object
      */
     abstract protected function getUserInfo($username);
-    
-    
+
+
     /**
      * Get the client IP address
      *
